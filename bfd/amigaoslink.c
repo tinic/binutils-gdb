@@ -67,10 +67,11 @@ the original routines from @file{linker.c} and @file{reloc.c}.
 #include "bfdlink.h"
 #include "genlink.h"
 #include "libamiga.h"
+#include "elf/m68k.h"
 #include <time.h>
 
 #ifndef alloca
-extern void * alloca PARAMS ((size_t));
+extern void * alloca (size_t);
 #endif
 
 #define bfd_msg (*_bfd_error_handler)
@@ -105,30 +106,32 @@ BFDDECL int amiga_base_relative = 0;
 BFDDECL int amiga_resident = 0;
 
 bool
-default_indirect_link_order PARAMS ((bfd *, struct bfd_link_info *,
-	 asection *, struct bfd_link_order *, bool));
+default_indirect_link_order (bfd *, struct bfd_link_info *,
+	 asection *, struct bfd_link_order *, bool);
 bfd_byte *
-get_relocated_section_contents PARAMS ((bfd *, struct bfd_link_info *,
-	struct bfd_link_order *, bfd_byte *, bool, asymbol **));
+get_relocated_section_contents (bfd *, struct bfd_link_info *,
+	struct bfd_link_order *, bfd_byte *, bool, asymbol **);
 bool
-amiga_final_link PARAMS ((bfd *, struct bfd_link_info *));
+amiga_final_link (bfd *, struct bfd_link_info *);
 bool
-aout_amiga_final_link PARAMS ((bfd *, struct bfd_link_info *));
+aout_amiga_final_link (bfd *, struct bfd_link_info *);
 
-bool amiga_slurp_relocs PARAMS ((bfd *, sec_ptr, asymbol **));
+bool amiga_slurp_relocs (bfd *, sec_ptr, asymbol **);
 
-sec_ptr amiga_make_unique_section PARAMS ((bfd *, const char *));
+sec_ptr amiga_make_unique_section (bfd *, const char *);
 
 static bfd_reloc_status_type
-my_add_to PARAMS ((arelent *, void *, int, int));
-static void amiga_update_target_section PARAMS ((sec_ptr));
+my_add_to (arelent *, void *, int, int);
+static void amiga_update_target_section (sec_ptr);
 static bfd_reloc_status_type
-amiga_perform_reloc PARAMS ((bfd *, arelent *, void *, sec_ptr, bfd *, char **));
+amiga_perform_reloc (bfd *, arelent *, void *, sec_ptr, bfd *, char **);
 static bfd_reloc_status_type
-aout_perform_reloc PARAMS ((bfd *, arelent *, void *, sec_ptr, bfd *, char **));
+aout_perform_reloc (bfd *, arelent *, void *, sec_ptr, bfd *, char **);
+static bfd_reloc_status_type
+elf_perform_reloc (bfd *, arelent *, void *, sec_ptr, bfd *, char **);
 static bool
-amiga_reloc_link_order PARAMS ((bfd *, struct bfd_link_info *, asection *,
-	struct bfd_link_order *));
+amiga_reloc_link_order (bfd *, struct bfd_link_info *, asection *,
+	struct bfd_link_order *);
 
 enum { ADDEND_UNSIGNED=0x01, RELOC_SIGNED=0x02 };
 
@@ -187,7 +190,9 @@ insert_long_jumps (bfd *abfd, bfd *input_bfd, asection *input_section, struct bf
 	  if (lol->type != bfd_indirect_link_order)
 	    continue;
 	  asection *s = lol->u.indirect.section;
-	  if (s->owner->xvec->flavour != bfd_target_amiga_flavour && s->owner->xvec->flavour != bfd_target_aout_flavour)
+	  if (s->owner->xvec->flavour != bfd_target_amiga_flavour
+	      && s->owner->xvec->flavour != bfd_target_aout_flavour
+	      && s->owner->xvec->flavour != bfd_target_elf_flavour)
 	    continue;
 
 //	  printf("%s:%p:%d:%d=%d -> %s:%d:%d\n", s->name, s, (int)s->output_offset, (int)s->rawsize, (int)(s->output_offset + s->rawsize),
@@ -213,6 +218,11 @@ insert_long_jumps (bfd *abfd, bfd *input_bfd, asection *input_section, struct bf
 	      if (lol->type != bfd_indirect_link_order)
 		continue;
 	      asection *s = lol->u.indirect.section;
+	      /* Only the amiga reloc chain is scanned, so an out-of-range
+		 16-bit branch in an ELF section gets no long jump and fails
+		 the link as out of range.  Covering ELF would mean walking
+		 its relocs from bfd_canonicalize_reloc here and in the jump
+		 table pass below.  */
 	      if (s->owner->xvec->flavour != bfd_target_amiga_flavour)
 		continue;
 
@@ -551,6 +561,13 @@ get_relocated_section_contents (
   else if (bfd_get_flavour (input_bfd) == bfd_target_aout_flavour)
     {
       reloc_func = aout_perform_reloc;
+      if (!input_section->rawsize)
+	input_section->rawsize = input_section->size;
+    }
+  else if (bfd_get_flavour (input_bfd) == bfd_target_elf_flavour
+	   && bfd_get_arch (input_bfd) == bfd_arch_m68k)
+    {
+      reloc_func = elf_perform_reloc;
       if (!input_section->rawsize)
 	input_section->rawsize = input_section->size;
     }
@@ -904,7 +921,7 @@ amiga_baserel_target_ok (sec_ptr target_section, asymbol *sym,
 }
 
 static bool
-is_dwarf_reloc (arelent *r, asection *sec)
+is_dwarf_reloc (asection *sec)
 {
     const char *n = sec->name;
     return (strcmp(n, ".debug_info")    == 0 ||
@@ -915,10 +932,31 @@ is_dwarf_reloc (arelent *r, asection *sec)
             strcmp(n, ".debug_str")     == 0);
 }
 
+/* An 8-bit pc-relative field in the low byte of a Bcc/BRA/BSR opcode
+   word is a short branch displacement, and 0 and -1 there select the
+   16- and 32-bit forms.  The reloc type cannot tell a branch from a
+   d8(pc,Xn) extension word or data, so check the opcode byte.  */
+static bfd_reloc_status_type
+check_byte_branch (arelent *r, void *data, char **error_message)
+{
+  bfd_byte *p = (bfd_byte *) data + r->address;
+  static char msg[64];
+
+  if (r->address == 0 || (r->address & 1) == 0
+      || (p[-1] & 0xf0) != 0x60
+      || (p[0] != 0x00 && p[0] != 0xff))
+    return bfd_reloc_ok;
+  snprintf (msg, sizeof (msg),
+	    _("byte branch displacement %d cannot be encoded"),
+	    p[0] == 0x00 ? 0 : -1);
+  *error_message = msg;
+  return bfd_reloc_dangerous;
+}
+
 /* Perform an Amiga relocation */
 static bfd_reloc_status_type
 amiga_perform_reloc (
-     bfd *abfd,
+     bfd *abfd ATTRIBUTE_UNUSED,
      arelent *r,
      void * data,
      sec_ptr sec,
@@ -1012,7 +1050,7 @@ amiga_perform_reloc (
     case H_ABS32:
 AbsReloc:
 	/* DWARF: section-relative relocations */
-	  if (is_dwarf_reloc(r, target_section))
+	  if (is_dwarf_reloc(target_section))
 		{
 			relocation = sym->value + r->addend + target_section->output_offset;
 		}
@@ -1129,6 +1167,8 @@ AbsReloc:
   /* Add in relocation */
   if (relocation!=0)
     ret = my_add_to (r, data, relocation, flags);
+  if (ret == bfd_reloc_ok && r->howto->type == H_PC8 && !copy)
+    ret = check_byte_branch (r, data, error_message);
 
   if (copy) /* Copy reloc to output section */
     {
@@ -1323,6 +1363,8 @@ aout_perform_reloc (
   /* Add in relocation */
   if (relocation!=0)
     ret = my_add_to (r, data, relocation, flags);
+  if (ret == bfd_reloc_ok && r->howto->type == H_PC8 && !copy)
+    ret = check_byte_branch (r, data, error_message);
 
   if (copy) /* Copy reloc to output section */
     {
@@ -1343,6 +1385,70 @@ struct generic_write_global_symbol_info
   bool failed;
 };
 
+/* Perform an m68k ELF relocation in a hunk link: turn it into the amiga
+   reloc of the same size and kind, and let amiga_perform_reloc apply it or
+   keep it for the loader.  ELF relocs carry their addend in the reloc
+   (RELA), amiga ones in the section data, so fold the addend into the
+   data first.  Anything a hunk cannot express is an error rather than a
+   silently resolved address.  */
+static bfd_reloc_status_type
+elf_perform_reloc (
+     bfd *abfd,
+     arelent *r,
+     void *data,
+     sec_ptr sec,
+     bfd *obfd,
+     char **error_message)
+{
+  static char msg[256];
+  bfd_reloc_status_type ret;
+  int index; /* into howto_table, in the order of amigaos.c's R_ABS32... */
+
+  switch (r->howto->type)
+    {
+    case R_68K_NONE:
+      return bfd_reloc_ok;
+    case R_68K_32:
+      index = 0;
+      break;
+    case R_68K_16:
+      index = 1;
+      break;
+    case R_68K_8:
+      index = 2;
+      break;
+    case R_68K_PC32:
+      index = 3;
+      break;
+    case R_68K_PC16:
+      index = 4;
+      break;
+    case R_68K_PC8:
+      index = 5;
+      break;
+    default:
+      /* GOT and PLT relocs would need the linker to build a GOT in a data
+	 hunk, and a4-relative small data has no standard ELF reloc; code
+	 for a hunk target should not need either.  */
+      snprintf (msg, sizeof (msg),
+		_("ELF reloc %s cannot be represented in an amiga hunk"),
+		r->howto->name);
+      *error_message = msg;
+      return bfd_reloc_dangerous;
+    }
+
+  r->howto = &howto_table[index];
+  if (r->addend != 0)
+    {
+      ret = my_add_to (r, data, r->addend, 0);
+      if (ret != bfd_reloc_ok)
+	return ret;
+      r->addend = 0;
+    }
+
+  return amiga_perform_reloc (abfd, r, data, sec, obfd, error_message);
+}
+
 extern bool _bfd_generic_link_write_global_symbol(struct generic_link_hash_entry *, void *);
 extern bool _bfd_generic_link_output_symbols(bfd *, bfd *, struct bfd_link_info *, size_t *);
 
@@ -1359,8 +1465,6 @@ amiga_final_link (
   size_t outsymalloc;
   struct generic_write_global_symbol_info wginfo;
   
-  struct bfd_link_hash_entry *h =
-    bfd_link_hash_lookup (info->hash, "___a4_init", false, false, true);
   struct bfd_link_hash_entry *h2 =
     bfd_link_hash_lookup (info->hash, "___a4_init2", false, false, true);
 

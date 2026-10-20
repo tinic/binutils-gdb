@@ -5152,11 +5152,13 @@ md_apply_fix (fixS *fixP, valueT *valP, segT seg ATTRIBUTE_UNUSED)
      a short branch with a value of 0 or -1, because those indicate
      different opcodes (branches with longer offsets).  fixup_segment
      in write.c may have clobbered fx_pcrel, so we need to examine the
-     reloc type.  */
+     reloc type.  A fixup left for the linker holds only a partial
+     value here, so the final displacement is not known yet.  */
   if ((fixP->fx_pcrel
        || fixP->fx_r_type == BFD_RELOC_8_PCREL
        || fixP->fx_r_type == BFD_RELOC_NONE)
       && fixP->fx_size == 1
+      && fixP->fx_done
       && (fixP->fx_addsy == NULL
 	  || S_IS_DEFINED (fixP->fx_addsy))
       && (val == 0 || val == -1))
@@ -8130,7 +8132,12 @@ md_pcrel_from_m68k (fixS *fixP, segT current_section)
        * explicit addend plus, when GAS has already replaced the symbol
        * by its section, the offset of the symbol in that section.
        * Both are in fx_offset, which the generic code starts from
-       * before subtracting MD_PCREL_FROM_SECTION, so subtract nothing.
+       * before subtracting MD_PCREL_FROM_SECTION, so return only the
+       * PC base relative to the field, -adjust: +1 for the 8-bit
+       * displacement of a branch, -1 for the 8-bit displacement in a
+       * brief extension word, -2 for the base displacement in a full
+       * extension word, 0 for a 16- or 32-bit branch or a 16-bit PC
+       * displacement.
        */
       if (fixP->fx_addsy)
 	{
@@ -8141,10 +8148,12 @@ md_pcrel_from_m68k (fixS *fixP, segT current_section)
 	     deferred.  A fixup against an ordinary symbol in the current
 	     section (e.g. a relaxed branch to a local label) is applied by
 	     GAS itself and needs the normal PC base.  */
-	  if ((sym->section != current_section
-	       && strcmp (sym->section->name, current_section->name))
+	  /* Distinct hunk sections may have the same name: the backend maps
+	     .text.unlikely to .text, for example.  Their placement is still
+	     left to the linker, so compare section identity, not names.  */
+	  if (sym->section != current_section
 	      || S_FORCE_RELOC (fixP->fx_addsy, 1))
-	    return 0;
+	    return -adjust;
 
 	  return fixP->fx_where + fixP->fx_frag->fr_address - adjust;
 	}
